@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from robonix_api import Primitive, Ok, Err, Deferred
+from robonix_api.ros import RosBackend
 
 from .backends import Backend, create_backend
 from .config import ConfigError, parse_config
@@ -36,6 +37,7 @@ _pkg_root = Path(
 _backend: Backend | None = None
 
 import chassis_pb2  # noqa: E402
+import health_pb2  # noqa: E402
 import std_msgs_pb2  # noqa: E402
 from quadruped_mcp import SetPosture_Request, SetPosture_Response  # noqa: E402
 
@@ -194,6 +196,179 @@ def set_posture(req: SetPosture_Request) -> SetPosture_Response:
     return SetPosture_Response(success=success, message=message)
 
 
+# ── chassis telemetry → Robonix health ───────────────────────────────────
+CHASSIS_STATUS_TOPIC = "/chassis/status"
+HEALTH_STREAM_INTERVAL_S = 0.5
+STATUS_STALE_S = 5.0
+
+_status_lock = threading.Lock()
+_status: dict = {}
+_status_seen = 0.0
+_health_stop = threading.Event()
+
+
+def _on_status(msg) -> None:
+    """Cache the latest /chassis/status frame for the health stream."""
+    global _status_seen
+    with _status_lock:
+        _status.update(
+            battery_level=float(msg.battery_level),
+            is_charging=bool(msg.is_charging),
+            error_state=int(msg.error_state),
+            basic_state=int(msg.basic_state),
+            gait_state=int(msg.gait_state),
+            motion_state=int(msg.motion_state),
+            task_state=int(msg.task_state),
+        )
+        _status_seen = time.monotonic()
+
+
+# ── sensor liveness → Soma component availability ─────────────────────────
+# Soma keeps a single authoritative health snapshot per robot: a later
+# provider's frame replaces the previous one outright, so one composite
+# reporter must cover every component. Liveness for the lidar/imu/camera is
+# taken from each device's own data path (topic freshness); client_audio is
+# available when the audio bridge is accepting connections; robot_audio when
+# the on-board ALSA card audio_driver plays through is present.
+LIDAR_CLOUD_TOPIC = "/scanner/cloud"
+IMU_TOPIC = "/livox/imu"
+CAMERA_INFO_TOPIC = "/camera/color/camera_info"
+AUDIO_BRIDGE_PORT = 60002
+# Card id in /proc/asound/cards for the on-board USB speaker/mic; matches the
+# plughw:Device,0 target configured for the audio_driver primitive.
+ROBOT_AUDIO_CARD = "Device"
+SENSOR_STALE_S = 5.0
+
+_sensor_lock = threading.Lock()
+_sensor_seen: dict[str, float] = {}
+
+
+def _mark_sensor(name: str) -> None:
+    with _sensor_lock:
+        _sensor_seen[name] = time.monotonic()
+
+
+def _sensor_fresh(name: str, now: float) -> bool:
+    with _sensor_lock:
+        seen = _sensor_seen.get(name)
+    return seen is not None and now - seen < SENSOR_STALE_S
+
+
+def _on_point_cloud(_msg) -> None:
+    _mark_sensor("mid360_lidar")
+
+
+def _on_imu(_msg) -> None:
+    _mark_sensor("mid360_imu")
+
+
+def _on_camera_info(_msg) -> None:
+    _mark_sensor("front_camera")
+
+
+def _audio_bridge_listening() -> bool:
+    """True while the audio bridge owns its TCP port (LISTEN or ESTABLISHED)."""
+    try:
+        with open("/proc/net/tcp", encoding="ascii") as fh:
+            next(fh)
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 4 or ":" not in fields[1]:
+                    continue
+                port = int(fields[1].rsplit(":", 1)[1], 16)
+                if port == AUDIO_BRIDGE_PORT and fields[3] in ("0A", "01"):
+                    return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _robot_audio_card_present() -> bool:
+    """True while the on-board USB audio card is enumerated by ALSA."""
+    try:
+        with open("/proc/asound/cards", encoding="ascii") as fh:
+            for line in fh:
+                if "[" not in line or "]" not in line:
+                    continue
+                card_id = line.split("[", 1)[1].split("]", 1)[0].strip()
+                if card_id == ROBOT_AUDIO_CARD:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _health_state() -> "health_pb2.HealthState":
+    """Project the cached chassis telemetry onto the Lite3 Soma components.
+
+    Component ids match soma.yaml (body/base, body/base/battery). Soma maps a
+    non-zero ``body/base/error`` control to an active fault, ``.../online`` to
+    component availability, and ``body/base/battery`` to the power source.
+    Sensor availability is reported as ``body/base/torso/<component>/online``.
+    """
+    with _status_lock:
+        snapshot = dict(_status)
+        age = time.monotonic() - _status_seen if _status_seen else None
+
+    readings = []
+    if age is not None:
+        online = 1.0 if age < STATUS_STALE_S else 0.0
+        readings.append(health_pb2.SensorReading(name="body/base/online", current_a=online))
+        readings.append(health_pb2.SensorReading(name="body/base/battery/online", current_a=online))
+        if age < STATUS_STALE_S:
+            readings.append(health_pb2.SensorReading(
+                name="body/base/error", current_a=float(snapshot["error_state"])))
+            # Unmeasured battery scalars stay at the -1 sentinel: Soma treats
+            # negative values as unavailable, while a protobuf default of 0.0
+            # would read as a real (and alarming) 0 V / 0 °C.
+            readings.append(health_pb2.SensorReading(
+                name="body/base/battery",
+                temp_c=-1.0,
+                voltage=-1.0,
+                current_a=-1.0,
+                battery_percent=snapshot["battery_level"]))
+    now = time.monotonic()
+    for component, online in (
+        ("mid360_lidar", _sensor_fresh("mid360_lidar", now)),
+        ("mid360_imu", _sensor_fresh("mid360_imu", now)),
+        ("front_camera", _sensor_fresh("front_camera", now)),
+        ("client_audio", _audio_bridge_listening()),
+        ("robot_audio", _robot_audio_card_present()),
+    ):
+        readings.append(health_pb2.SensorReading(
+            name=f"body/base/torso/{component}/online",
+            current_a=1.0 if online else 0.0,
+        ))
+    return health_pb2.HealthState(
+        voltage=-1.0,
+        charging=bool(snapshot.get("is_charging", False)),
+        remaining_s=-1,
+        readings=readings,
+    )
+
+
+@lite3_quadruped.grpc(
+    "robonix/primitive/health/state",
+    description=(
+        "Read the latest Lite3 chassis telemetry (battery, charging, fault "
+        "code) as a Robonix health frame."
+    ),
+)
+def get_health_state(_request: "health_pb2.GetHealthState_Request") -> "health_pb2.GetHealthState_Response":
+    return health_pb2.GetHealthState_Response(state=_health_state())
+
+
+@lite3_quadruped.grpc(
+    "robonix/primitive/health/stream",
+    description="Stream Lite3 chassis telemetry into Soma's health collector.",
+)
+def stream_health_state(_request, context):
+    """Yield telemetry frames until the consumer disconnects or shutdown."""
+    while context.is_active() and not _health_stop.is_set():
+        yield _health_state()
+        _health_stop.wait(HEALTH_STREAM_INTERVAL_S)
+
+
 @lite3_quadruped.on_init
 def init(cfg):
     """Select a backend, register common capabilities, and check sentinels."""
@@ -241,6 +416,25 @@ def init(cfg):
             qos="reliable",
         )
 
+        if runtime.backend == "hardware":
+            # Internal subscriber for the transfer bridge's RobotState decode.
+            # No chassis-status contract exists, so bypass contract declaration
+            # and use the shared ROS backend directly.
+            from transfer_interfaces.msg import RobotStatus  # type: ignore
+
+            RosBackend.get().create_subscription(
+                RobotStatus, CHASSIS_STATUS_TOPIC, _on_status, qos="best_effort")
+
+            # Liveness taps for the MID-360 lidar/IMU and front camera: only
+            # message arrival time matters, contents are ignored.
+            from sensor_msgs.msg import CameraInfo, Imu, PointCloud2  # type: ignore
+
+            backend = RosBackend.get()
+            backend.create_subscription(PointCloud2, LIDAR_CLOUD_TOPIC, _on_point_cloud, qos="best_effort")
+            backend.create_subscription(Imu, IMU_TOPIC, _on_imu, qos="best_effort")
+            backend.create_subscription(CameraInfo, CAMERA_INFO_TOPIC, _on_camera_info, qos="best_effort")
+            _health_stop.clear()
+
         for topic in _backend.required_topics():
             if not _backend.wait_for_topic(lite3_quadruped, topic):
                 _backend.shutdown()
@@ -268,6 +462,7 @@ def init(cfg):
 def shutdown():
     """Stop motion and shut down only the selected backend."""
     global cmd_vel_pub, _backend
+    _health_stop.set()
     if cmd_vel_pub is not None:
         try:
             from geometry_msgs.msg import Twist  # type: ignore

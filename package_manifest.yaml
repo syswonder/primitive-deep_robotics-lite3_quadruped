@@ -26,3 +26,7 @@ capabilities:
   - name: robonix/primitive/chassis/twist_in
   - name: robonix/primitive/chassis/odom
   - name: robonix/primitive/chassis/posture
+  # Canonical health contracts (live under <robonix>/capabilities/primitive/health/):
+  # chassis telemetry is reported through the Robonix health pipeline (Soma/Vitals).
+  - name: robonix/primitive/health/state
+  - name: robonix/primitive/health/stream

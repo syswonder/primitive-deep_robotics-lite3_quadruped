@@ -12,6 +12,7 @@
 #include "tf2_ros/transform_broadcaster.h"
 #include "transfer_interfaces/msg/motion_simple_cmd.hpp"
 #include "transfer_interfaces/msg/motion_complex_cmd.hpp"
+#include "transfer_interfaces/msg/robot_status.hpp"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -73,6 +74,8 @@ public:
         rclcpp::QoS best_effort_qos(1);
         best_effort_qos.best_effort();
         handle_pub_ = create_publisher<geometry_msgs::msg::Twist>("/handle_state", best_effort_qos);
+
+        robot_status_pub_ = create_publisher<transfer_interfaces::msg::RobotStatus>("/chassis/status", 10);
 
         recv_thread_ = std::thread(&MotionReceiver::RunRoutine, this);
 
@@ -182,7 +185,19 @@ public:
             std_msgs::msg::Float64 ultrasound_distance;
             ultrasound_distance.data = robot_state->ultrasound[1];
             ultrasound_pub_->publish(ultrasound_distance);
-            
+
+            transfer_interfaces::msg::RobotStatus robot_status;
+            robot_status.battery_level = robot_state->battery_level;
+            robot_status.is_charging = robot_state->is_charging;
+            robot_status.error_state = robot_state->error_state;
+            robot_status.basic_state = robot_state->robot_basic_state;
+            robot_status.gait_state = robot_state->robot_gait_state;
+            robot_status.motion_state = robot_state->robot_motion_state;
+            robot_status.task_state = robot_state->task_state;
+            robot_status.zero_position_flag = robot_state->zero_position_flag;
+            robot_status.is_robot_need_move = robot_state->is_robot_need_move;
+            robot_status_pub_->publish(robot_status);
+
             geometry_msgs::msg::TransformStamped leg_odom_trans;       
             leg_odom_trans.header = leg_odom_data2.header;
             leg_odom_trans.child_frame_id = leg_odom_data2.child_frame_id;
@@ -315,6 +330,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_200_;    
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr handle_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr ultrasound_pub_;
+    rclcpp::Publisher<transfer_interfaces::msg::RobotStatus>::SharedPtr robot_status_pub_;
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     bool publish_odom_tf_{true};
     std::string odom_topic_{"/odom"};
